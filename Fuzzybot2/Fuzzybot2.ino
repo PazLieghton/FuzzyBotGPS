@@ -1,238 +1,659 @@
 /*
-   FuzzyBot Motor Driver - powerful, safe, simple
-   Listens to ESP32 on A0 via SoftwareSerial.
-   Drives 4 DC motors through an Adafruit Motor Shield (AFMotor).
+   FuzzyBot Motor Driver - v3.1
+   Arduino Uno R3 + AFMotor-compatible L293D shield
+   4 DC motors, 3S 18650 battery pack
 
-   - Increased default speeds so the robot can actually move.
-   - Soft-start ramp for forward/backward/spin to prevent sudden current
-     spikes and make motion smoother.
-   - Direct turn commands (L/R) for quick in-place rotation.
-   - 3-second watchdog stops motors if ESP32 connection is lost.
+   PURPOSE
+   -------
+   This is the "body" controller. The ESP32 brain sends simple commands:
+
+       F = forward
+       B = backward
+       L = tank-turn left
+       R = tank-turn right
+       S = spin in place
+       X = stop
+       + = increase cruise speed
+       - = decrease cruise speed
+
+   IMPORTANT DESIGN CHANGES
+   ------------------------
+   1. Forward/backward uses all four motors.
+   2. Left/right turns now use ALL FOUR MOTORS:
+          left side   = one direction
+          right side  = opposite direction
+      This gives maximum traction but draws more current.
+   3. "S" also uses all four motors (same as a right turn).
+   4. Braking is fast.
+   5. Reversing is safe:
+          direction -> STOP -> short dead-time -> new direction -> ramp up
+      This avoids commanding a loaded motor to reverse instantly.
+   6. Acceleration is deliberately slow to reduce current spikes
+      from the 3S battery and L293D shield.
+   7. The Arduino does NOT print every command continuously.
+      Excessive serial printing can make timing less predictable.
+   8. A watchdog stops the robot if the ESP32 stops sending commands.
+
+   NOTE ABOUT TURNING
+   -------------------
+   All four motors are driven during turns, so the robot pivots around its centre.
+   If turning is erratic, try:
+       - Lower TURN_SPEED further (already set to 100)
+       - Add weight directly over the centre of the wheelbase
+       - Check that all wheels have similar traction
+   Because an L293D has a relatively large voltage drop, the robot
+   may already have much less motor voltage than the 3S pack voltage.
+   Do NOT compensate by immediately pushing every PWM value to 255.
+   Test current, temperature, and motor behavior first.
 */
 
 #include <AFMotor.h>
 #include <SoftwareSerial.h>
 
-// Listen to ESP32 on A0 (RX), A1 unused (TX)
+// ================================================================
+// SERIAL CONNECTION TO ESP32
+// ================================================================
+
+// ESP32 -> Arduino A0
+// A1 is unused for now.
 SoftwareSerial espSerial(A0, A1);
 
-AF_DCMotor motorFL(1);
-AF_DCMotor motorFR(2);
-AF_DCMotor motorBL(3);
-AF_DCMotor motorBR(4);
+// ================================================================
+// MOTOR OBJECTS
+// ================================================================
 
-// ---------------- Tunables ----------------
-int motorSpeed        = 220;   // cruise speed for F/B (0-255)
-const int TURN_SPEED  = 180;   // speed for L/R (in-place turn)
-const int SPIN_SPEED  = 220;   // speed for S (manual spin)
-const int SPEED_STEP  = 20;    // amount +/- changes cruise speed
-const int SPEED_MAX   = 255;
-const int SPEED_MIN   = 0;
+AF_DCMotor motorFL(1);   // Front Left
+AF_DCMotor motorFR(2);   // Front Right
+AF_DCMotor motorBL(3);   // Back Left
+AF_DCMotor motorBR(4);   // Back Right
 
-// Soft-start ramp (only for F/B/S)
-const int RAMP_STEP_SIZE     = 15;   // PWM increase per step
-const unsigned long RAMP_INTERVAL = 20; // ms between ramp steps
+// ================================================================
+// SPEED SETTINGS
+// ================================================================
 
-const unsigned long COMMAND_TIMEOUT = 3000; // ms of silence before auto-stop
-// -------------------------------------------
+// Normal driving speed.
+// Start conservatively because the robot runs from a 3S pack.
+int motorSpeed = 170;
 
-// Current commanded state
-bool haveTarget = false;          // true when we should be moving
-int  desiredDirLeft  = RELEASE;
-int  desiredSpeedLeft = 0;
-int  desiredDirRight = RELEASE;
-int  desiredSpeedRight = 0;
+// Maximum normal cruise speed.
+const int SPEED_MAX = 200;
+const int SPEED_MIN = 70;
 
-// Current motor state (for ramp)
-int  activeDirLeft  = RELEASE;
-int  activeSpeedLeft = 0;
-int  activeDirRight = RELEASE;
-int  activeSpeedRight = 0;
+// How much + / - changes the requested cruise speed.
+const int SPEED_STEP = 15;
 
-unsigned long lastRampStep = 0;
+// Turning speed – reduced to improve turn predictability with all wheels.
+const int TURN_SPEED = 255;
+
+// ================================================================
+// MOTOR RAMP SETTINGS
+// ================================================================
+
+// Speeding up is slow to reduce current spikes.
+//
+// Slowing down is much faster because reducing PWM reduces current.
+const int RAMP_UP_STEP = 8;
+const int RAMP_DOWN_STEP = 45;
+
+// Time between ramp updates.
+const unsigned long RAMP_INTERVAL_MS = 20;
+
+// Small dead-time before reversing direction.
+// This gives the motor a moment with zero drive.
+const unsigned long REVERSAL_DEADTIME_MS = 60;
+
+// ================================================================
+// COMMUNICATION WATCHDOG
+// ================================================================
+
+// If the Arduino hears nothing from the ESP32 for this long,
+// it releases all motors.
+const unsigned long COMMAND_TIMEOUT_MS = 3000;
+
+// ================================================================
+// DESIRED MOTOR STATE
+// ================================================================
+
+int desiredDirFL = RELEASE;
+int desiredDirFR = RELEASE;
+int desiredDirBL = RELEASE;
+int desiredDirBR = RELEASE;
+
+int desiredSpeedFL = 0;
+int desiredSpeedFR = 0;
+int desiredSpeedBL = 0;
+int desiredSpeedBR = 0;
+
+// ================================================================
+// ACTIVE MOTOR STATE
+// ================================================================
+
+int activeDirFL = RELEASE;
+int activeDirFR = RELEASE;
+int activeDirBL = RELEASE;
+int activeDirBR = RELEASE;
+
+int activeSpeedFL = 0;
+int activeSpeedFR = 0;
+int activeSpeedBL = 0;
+int activeSpeedBR = 0;
+
+// ================================================================
+// REVERSAL STATE
+// ================================================================
+
+bool reversalWaitingFL = false;
+bool reversalWaitingFR = false;
+bool reversalWaitingBL = false;
+bool reversalWaitingBR = false;
+
+unsigned long reversalStartFL = 0;
+unsigned long reversalStartFR = 0;
+unsigned long reversalStartBL = 0;
+unsigned long reversalStartBR = 0;
+
+// ================================================================
+// GLOBAL STATE
+// ================================================================
+
+bool haveTarget = false;
+
+unsigned long lastRampUpdate = 0;
 unsigned long lastCommandTime = 0;
 
+// ================================================================
+// SETUP
+// ================================================================
+
 void setup() {
+
   Serial.begin(9600);
   espSerial.begin(9600);
 
+  // On-board LED = communication/activity indicator.
   pinMode(13, OUTPUT);
   digitalWrite(13, LOW);
 
-  // Start all motors released
-  releaseAll();
-  lastCommandTime = millis();
-  lastRampStep = millis();
+  stopImmediately();
 
-  Serial.println("Motor driver ready. Listening on A0...");
+  lastCommandTime = millis();
+  lastRampUpdate = millis();
+
+  Serial.println("FuzzyBot body v3.1 ready.");
 }
 
+// ================================================================
+// MAIN LOOP
+// ================================================================
+
 void loop() {
-  // Watchdog: if no command for 3 seconds, stop safely
-  if (millis() - lastCommandTime > COMMAND_TIMEOUT) {
+
+  // ------------------------------------------------------------
+  // SAFETY WATCHDOG
+  // ------------------------------------------------------------
+
+  if (millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
+
     if (haveTarget) {
-      Serial.println("WATCHDOG: no command - stopping.");
-      releaseAll();
+
+      stopImmediately();
       haveTarget = false;
-      digitalWrite(13, LOW);
+
+      Serial.println("WATCHDOG: ESP32 communication lost.");
     }
   }
 
-  // Process incoming commands
-  if (espSerial.available() > 0) {
+  // ------------------------------------------------------------
+  // READ ESP32 COMMANDS
+  // ------------------------------------------------------------
+
+  while (espSerial.available() > 0) {
+
     char cmd = espSerial.read();
-    if (cmd != '\n' && cmd != '\r') {
-      lastCommandTime = millis();
-      digitalWrite(13, HIGH);
-      Serial.print("Command: ");
-      Serial.println(cmd);
 
-      switch (cmd) {
-        case 'F': setTarget(FORWARD, motorSpeed, FORWARD, motorSpeed, true); break;
-        case 'B': setTarget(BACKWARD, motorSpeed, BACKWARD, motorSpeed, true); break;
-        case 'L': setTarget(BACKWARD, TURN_SPEED, FORWARD, TURN_SPEED, false); break;
-        case 'R': setTarget(FORWARD, TURN_SPEED, BACKWARD, TURN_SPEED, false); break;
-        case 'S': setTarget(FORWARD, SPIN_SPEED, BACKWARD, SPIN_SPEED, true); break;
-        case 'X': releaseAll(); haveTarget = false; digitalWrite(13, LOW); break;
-        case '+': increaseSpeed(); break;
-        case '-': decreaseSpeed(); break;
-        default:   Serial.println("Unknown command"); break;
-      }
-    }
+    // Ignore line endings.
+    if (cmd == '\n' || cmd == '\r')
+      continue;
+
+    lastCommandTime = millis();
+    digitalWrite(13, HIGH);
+
+    handleCommand(cmd);
   }
 
-  // Update motor speeds with ramp (non-blocking)
+  // ------------------------------------------------------------
+  // MOVE MOTORS TOWARD THEIR TARGETS
+  // ------------------------------------------------------------
+
   updateMotors();
 }
 
+// ================================================================
+// COMMAND HANDLER
+// ================================================================
+
+void handleCommand(char cmd) {
+
+  switch (cmd) {
+
+    case 'F':
+      moveForward();
+      break;
+
+    case 'B':
+      moveBackward();
+      break;
+
+    case 'L':
+      turnLeft();
+      break;
+
+    case 'R':
+      turnRight();
+      break;
+
+    case 'S':
+      spinInPlace();
+      break;
+
+    case 'X':
+      stopImmediately();
+      haveTarget = false;
+      digitalWrite(13, LOW);
+      break;
+
+    case '+':
+      increaseSpeed();
+      break;
+
+    case '-':
+      decreaseSpeed();
+      break;
+
+    default:
+      // Ignore unknown characters instead of doing anything dangerous.
+      break;
+  }
+}
+
+// ================================================================
+// HIGH-LEVEL MOVEMENT COMMANDS
+// ================================================================
+
 // ------------------------------------------------------------
-// Set desired movement direction and speed for both sides.
-// If useRamp is true, the new target will be approached gradually.
-// If false (turns), it applies immediately.
+// FORWARD
+// All four motors drive forward.
 // ------------------------------------------------------------
-void setTarget(int dirL, int spdL, int dirR, int spdR, bool useRamp) {
-  desiredDirLeft   = dirL;
-  desiredSpeedLeft  = spdL;
-  desiredDirRight  = dirR;
-  desiredSpeedRight = spdR;
+
+void moveForward() {
+
+  setWheelTargets(
+    FORWARD,  motorSpeed,
+    FORWARD,  motorSpeed,
+    FORWARD,  motorSpeed,
+    FORWARD,  motorSpeed
+  );
+
   haveTarget = true;
-
-  if (!useRamp) {
-    // Direct set for turns (L/R) – instant response
-    applyMotorState(desiredDirLeft, desiredSpeedLeft,
-                    desiredDirRight, desiredSpeedRight);
-  }
-  // If useRamp is true, updateMotors() will gradually ramp to target
 }
 
 // ------------------------------------------------------------
-// Gradually adjust motor speeds to match desired target.
-// Called every loop iteration, but only steps every RAMP_INTERVAL ms.
+// BACKWARD
+// All four motors drive backward.
 // ------------------------------------------------------------
+
+void moveBackward() {
+
+  setWheelTargets(
+    BACKWARD, motorSpeed,
+    BACKWARD, motorSpeed,
+    BACKWARD, motorSpeed,
+    BACKWARD, motorSpeed
+  );
+
+  haveTarget = true;
+}
+
+// ------------------------------------------------------------
+// RIGHT TURN – all four wheels
+// Left side: forward
+// Right side: backward
+// ------------------------------------------------------------
+
+void turnRight() {
+
+  setWheelTargets(
+    FORWARD,  TURN_SPEED,   // FL
+    BACKWARD, TURN_SPEED,   // FR
+    FORWARD,  TURN_SPEED,   // BL
+    BACKWARD, TURN_SPEED    // BR
+  );
+
+  haveTarget = true;
+}
+
+// ------------------------------------------------------------
+// LEFT TURN – all four wheels
+// Left side: backward
+// Right side: forward
+// ------------------------------------------------------------
+
+void turnLeft() {
+
+  setWheelTargets(
+    BACKWARD, TURN_SPEED,   // FL
+    FORWARD,  TURN_SPEED,   // FR
+    BACKWARD, TURN_SPEED,   // BL
+    FORWARD,  TURN_SPEED    // BR
+  );
+
+  haveTarget = true;
+}
+
+// ------------------------------------------------------------
+// SPIN IN PLACE – same as a right turn
+// (change direction if you want left spin)
+// ------------------------------------------------------------
+
+void spinInPlace() {
+
+  setWheelTargets(
+    FORWARD,  TURN_SPEED,
+    BACKWARD, TURN_SPEED,
+    FORWARD,  TURN_SPEED,
+    BACKWARD, TURN_SPEED
+  );
+
+  haveTarget = true;
+}
+
+// ================================================================
+// SET DESIRED WHEEL STATES
+// ================================================================
+
+void setWheelTargets(
+  int dirFL, int spdFL,
+  int dirFR, int spdFR,
+  int dirBL, int spdBL,
+  int dirBR, int spdBR
+) {
+
+  desiredDirFL = dirFL;
+  desiredDirFR = dirFR;
+  desiredDirBL = dirBL;
+  desiredDirBR = dirBR;
+
+  desiredSpeedFL = spdFL;
+  desiredSpeedFR = spdFR;
+  desiredSpeedBL = spdBL;
+  desiredSpeedBR = spdBR;
+}
+
+// ================================================================
+// MOTOR UPDATE LOOP
+// ================================================================
+
 void updateMotors() {
-  if (!haveTarget) return;   // already stopped
 
-  if (millis() - lastRampStep < RAMP_INTERVAL) return;
-  lastRampStep = millis();
+  if (!haveTarget)
+    return;
 
-  // Adjust left side
-  adjustSide(activeDirLeft, activeSpeedLeft, desiredDirLeft, desiredSpeedLeft,
-             motorFL, motorBL);
-  // Adjust right side
-  adjustSide(activeDirRight, activeSpeedRight, desiredDirRight, desiredSpeedRight,
-             motorFR, motorBR);
+  if (millis() - lastRampUpdate < RAMP_INTERVAL_MS)
+    return;
+
+  lastRampUpdate = millis();
+
+  adjustWheel(
+    activeDirFL,
+    activeSpeedFL,
+    desiredDirFL,
+    desiredSpeedFL,
+    reversalWaitingFL,
+    reversalStartFL,
+    motorFL
+  );
+
+  adjustWheel(
+    activeDirFR,
+    activeSpeedFR,
+    desiredDirFR,
+    desiredSpeedFR,
+    reversalWaitingFR,
+    reversalStartFR,
+    motorFR
+  );
+
+  adjustWheel(
+    activeDirBL,
+    activeSpeedBL,
+    desiredDirBL,
+    desiredSpeedBL,
+    reversalWaitingBL,
+    reversalStartBL,
+    motorBL
+  );
+
+  adjustWheel(
+    activeDirBR,
+    activeSpeedBR,
+    desiredDirBR,
+    desiredSpeedBR,
+    reversalWaitingBR,
+    reversalStartBR,
+    motorBR
+  );
 }
 
-void adjustSide(int &actDir, int &actSpd, int desDir, int desSpd,
-                AF_DCMotor &motorA, AF_DCMotor &motorB) {
-  // If direction needs to change, first ramp down speed to 0,
-  // then change direction and ramp up.
-  if (actDir != desDir) {
-    if (actSpd > 0) {
-      actSpd = max(0, actSpd - RAMP_STEP_SIZE);
-      motorA.setSpeed(actSpd);
-      motorB.setSpeed(actSpd);
+// ================================================================
+// SINGLE-WHEEL CONTROL
+// ================================================================
+//
+// Direction changes are handled safely:
+//
+// 1. Ramp speed down quickly.
+// 2. Set PWM to zero.
+// 3. Wait a short dead-time.
+// 4. Change direction.
+// 5. Ramp speed up slowly.
+//
+// This is particularly important for F -> B and B -> F commands.
+// ================================================================
+
+void adjustWheel(
+  int &activeDir,
+  int &activeSpeed,
+  int desiredDir,
+  int desiredSpeed,
+  bool &reversalWaiting,
+  unsigned long &reversalStart,
+  AF_DCMotor &motor
+) {
+
+  // ------------------------------------------------------------
+  // HANDLE DIRECTION CHANGE
+  // ------------------------------------------------------------
+
+  if (activeDir != desiredDir) {
+
+    // First, quickly reduce PWM to zero.
+    if (activeSpeed > 0) {
+
+      activeSpeed =
+        max(0, activeSpeed - RAMP_DOWN_STEP);
+
+      motor.setSpeed(activeSpeed);
+
       return;
-    } else {
-      // Direction can be changed now
-      motorA.run(desDir);
-      motorB.run(desDir);
-      actDir = desDir;
     }
+
+    // ----------------------------------------------------------
+    // We are at zero speed.
+    // Add a short dead-time before changing direction.
+    // ----------------------------------------------------------
+
+    if (!reversalWaiting) {
+
+      reversalWaiting = true;
+      reversalStart = millis();
+
+      motor.setSpeed(0);
+      motor.run(RELEASE);
+
+      return;
+    }
+
+    if (millis() - reversalStart < REVERSAL_DEADTIME_MS) {
+
+      motor.setSpeed(0);
+      motor.run(RELEASE);
+
+      return;
+    }
+
+    // ----------------------------------------------------------
+    // Dead-time finished: change direction.
+    // ----------------------------------------------------------
+
+    motor.run(desiredDir);
+
+    activeDir = desiredDir;
+    reversalWaiting = false;
   }
 
-  // Adjust speed toward target
-  if (actSpd < desSpd) {
-    actSpd = min(desSpd, actSpd + RAMP_STEP_SIZE);
-    motorA.setSpeed(actSpd);
-    motorB.setSpeed(actSpd);
-  } else if (actSpd > desSpd) {
-    actSpd = max(desSpd, actSpd - RAMP_STEP_SIZE);
-    motorA.setSpeed(actSpd);
-    motorB.setSpeed(actSpd);
+  // ------------------------------------------------------------
+  // HANDLE SPEED CHANGE
+  // ------------------------------------------------------------
+
+  if (activeSpeed < desiredSpeed) {
+
+    activeSpeed =
+      min(
+        desiredSpeed,
+        activeSpeed + RAMP_UP_STEP
+      );
+
+    motor.setSpeed(activeSpeed);
+
+  } else if (activeSpeed > desiredSpeed) {
+
+    activeSpeed =
+      max(
+        desiredSpeed,
+        activeSpeed - RAMP_DOWN_STEP
+      );
+
+    motor.setSpeed(activeSpeed);
   }
-
-  // If speed is zero and direction is not RELEASE, we may want to keep
-  // direction active but at zero speed; that's fine.
 }
 
-// ------------------------------------------------------------
-// Immediate motor state set (used for direct turns and stop)
-// ------------------------------------------------------------
-void applyMotorState(int dirL, int spdL, int dirR, int spdR) {
-  motorFL.setSpeed(spdL);
-  motorBL.setSpeed(spdL);
-  motorFL.run(dirL);
-  motorBL.run(dirL);
+// ================================================================
+// IMMEDIATE STOP
+// ================================================================
+//
+// This is for:
+//
+// - X command
+// - watchdog
+// - emergency stop
+//
+// RELEASE means the motors are no longer being electrically driven.
+// ================================================================
 
-  motorFR.setSpeed(spdR);
-  motorBR.setSpeed(spdR);
-  motorFR.run(dirR);
-  motorBR.run(dirR);
+void stopImmediately() {
 
-  activeDirLeft = dirL;
-  activeSpeedLeft = spdL;
-  activeDirRight = dirR;
-  activeSpeedRight = spdR;
+  motorFL.setSpeed(0);
+  motorFR.setSpeed(0);
+  motorBL.setSpeed(0);
+  motorBR.setSpeed(0);
+
+  motorFL.run(RELEASE);
+  motorFR.run(RELEASE);
+  motorBL.run(RELEASE);
+  motorBR.run(RELEASE);
+
+  activeDirFL = RELEASE;
+  activeDirFR = RELEASE;
+  activeDirBL = RELEASE;
+  activeDirBR = RELEASE;
+
+  activeSpeedFL = 0;
+  activeSpeedFR = 0;
+  activeSpeedBL = 0;
+  activeSpeedBR = 0;
+
+  reversalWaitingFL = false;
+  reversalWaitingFR = false;
+  reversalWaitingBL = false;
+  reversalWaitingBR = false;
 }
 
-// ------------------------------------------------------------
-// Stop all motors immediately (no ramp)
-// ------------------------------------------------------------
-void releaseAll() {
-  motorFL.setSpeed(0); motorBL.setSpeed(0);
-  motorFR.setSpeed(0); motorBR.setSpeed(0);
-  motorFL.run(RELEASE); motorBL.run(RELEASE);
-  motorFR.run(RELEASE); motorBR.run(RELEASE);
+// ================================================================
+// INCREASE SPEED
+// ================================================================
 
-  activeDirLeft = RELEASE;
-  activeSpeedLeft = 0;
-  activeDirRight = RELEASE;
-  activeSpeedRight = 0;
-}
-
-// ------------------------------------------------------------
-// Increase / decrease cruise speed (affects F/B only)
-// ------------------------------------------------------------
 void increaseSpeed() {
-  motorSpeed = min(motorSpeed + SPEED_STEP, SPEED_MAX);
-  Serial.print("Speed: ");
-  Serial.println(motorSpeed);
 
-  // If currently moving forward/backward, update target speed
-  if (haveTarget && activeDirLeft == FORWARD && activeDirRight == FORWARD) {
-    desiredSpeedLeft = motorSpeed;
-    desiredSpeedRight = motorSpeed;
-  }
+  motorSpeed =
+    min(
+      motorSpeed + SPEED_STEP,
+      SPEED_MAX
+    );
+
+  // Only change live targets when actually cruising forward/backward.
+  updateCruiseTargets();
+
+  Serial.print("Cruise speed: ");
+  Serial.println(motorSpeed);
 }
+
+// ================================================================
+// DECREASE SPEED
+// ================================================================
 
 void decreaseSpeed() {
-  motorSpeed = max(motorSpeed - SPEED_STEP, SPEED_MIN);
-  Serial.print("Speed: ");
-  Serial.println(motorSpeed);
 
-  if (haveTarget && activeDirLeft == FORWARD && activeDirRight == FORWARD) {
-    desiredSpeedLeft = motorSpeed;
-    desiredSpeedRight = motorSpeed;
+  motorSpeed =
+    max(
+      motorSpeed - SPEED_STEP,
+      SPEED_MIN
+    );
+
+  updateCruiseTargets();
+
+  Serial.print("Cruise speed: ");
+  Serial.println(motorSpeed);
+}
+
+// ================================================================
+// UPDATE ACTIVE CRUISE COMMAND
+// ================================================================
+//
+// This keeps + / - working while the robot is already driving.
+// It deliberately does nothing during a turn.
+// ================================================================
+
+void updateCruiseTargets() {
+
+  if (!haveTarget)
+    return;
+
+  bool allForward =
+    activeDirFL == FORWARD &&
+    activeDirFR == FORWARD &&
+    activeDirBL == FORWARD &&
+    activeDirBR == FORWARD;
+
+  bool allBackward =
+    activeDirFL == BACKWARD &&
+    activeDirFR == BACKWARD &&
+    activeDirBL == BACKWARD &&
+    activeDirBR == BACKWARD;
+
+  if (allForward || allBackward) {
+
+    desiredSpeedFL = motorSpeed;
+    desiredSpeedFR = motorSpeed;
+    desiredSpeedBL = motorSpeed;
+    desiredSpeedBR = motorSpeed;
   }
 }

@@ -43,9 +43,7 @@ int numWaypoints = 0;
 int currentWaypointIndex = 0;
 
 bool autoMode = false;
-enum NavState { NAV_IDLE,
-                NAV_MOVING,
-                NAV_TURNING };
+enum NavState { NAV_IDLE,NAV_MOVING,NAV_TURNING };
 NavState navState = NAV_IDLE;
 
 unsigned long lastNavAction = 0;
@@ -59,7 +57,6 @@ float headingCorrectionDeg = 0.0;
 
 int motorSpeed = 220;
    // matches Arduino default
-
   // Debug info string (sent in telemetry)
   String navDebug = "Idle";
 
